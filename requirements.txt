@@ -1,4 +1,3 @@
 streamlit
 pandas
 plotly
-nsrdb-sam-analysis  # Adjust the name if this package has a different name on PyPI 
