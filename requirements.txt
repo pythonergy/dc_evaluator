@@ -1,3 +1,6 @@
 streamlit
 pandas
 plotly
+NREL-PySAM
+requests
+numpy

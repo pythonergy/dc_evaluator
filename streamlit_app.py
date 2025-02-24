@@ -27,6 +27,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def main():
+    # Add this near the top of main(), after setting up session state for terminal output
+    if 'is_running' not in st.session_state:
+        st.session_state.is_running = False
+
     st.title("☀️ NSRDB SAM Analysis Tool")
     
     # Move all configuration to sidebar
@@ -222,8 +226,20 @@ def main():
     
     logger.addHandler(streamlit_handler)
     
-    # Run analysis button (in sidebar)
-    if st.sidebar.button("Run Analysis", type="primary"):
+    # Modify the Run Analysis and add Stop button section
+    col1, col2 = st.sidebar.columns(2)
+    
+    if not st.session_state.is_running:
+        if col1.button("Run Analysis", type="primary"):
+            st.session_state.is_running = True
+            st.rerun()
+    else:
+        if col1.button("Stop Analysis", type="secondary"):
+            st.session_state.is_running = False
+            st.rerun()
+
+    # Modify your analysis section
+    if st.session_state.is_running:
         # Clear previous terminal output
         st.session_state.terminal_output = ""
         try:
@@ -256,7 +272,12 @@ def main():
                     'availability': availability
                 }
             )
-            
+
+            # Add check for stop condition throughout the analysis
+            if not st.session_state.is_running:
+                st.warning("Analysis stopped by user")
+                return
+
             # Update analyzer's NSRDB settings
             analyzer.your_name = name
             analyzer.your_email = email
@@ -269,22 +290,40 @@ def main():
             run_dir = os.path.join(output_dir, f"run_{timestamp}")
             os.makedirs(run_dir, exist_ok=True)
             
+            # Check for stop condition
+            if not st.session_state.is_running:
+                st.warning("Analysis stopped by user")
+                return
+
             # Dump system settings
             status_text.text("Saving system settings...")
             system_settings = analyzer.dump_system_settings(run_dir)
             progress_bar.progress(0.1)
             
+            # Check for stop condition
+            if not st.session_state.is_running:
+                st.warning("Analysis stopped by user")
+                return
+
             # Run analysis
             status_text.text("Running analysis...")
             results = analyzer.analyze_all_years()
             progress_bar.progress(0.8)
             
+            # Check for stop condition
+            if not st.session_state.is_running:
+                st.warning("Analysis stopped by user")
+                return
+
             # Save results
             status_text.text("Saving results...")
             analyzer.save_results_to_csv(results, run_dir)
             progress_bar.progress(1.0)
             status_text.text("Analysis complete!")
             
+            # Reset running state after completion
+            st.session_state.is_running = False
+
             # Display results in tabs
             tab1, tab2, tab3 = st.tabs(["Summary", "Detailed Results", "System Settings"])
             
@@ -375,7 +414,8 @@ def main():
         
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
-    
+            st.session_state.is_running = False  # Reset running state on error
+
     # Add footer
     st.sidebar.markdown("---")
     st.sidebar.markdown(
