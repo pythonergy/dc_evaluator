@@ -191,7 +191,9 @@ def main():
     
     # Main area for results and terminal output
     # Create containers for terminal output and results
-    terminal_container = st.expander("Terminal Output", expanded=False)  # Changed to expander
+    terminal_expander = st.expander("Terminal Output", expanded=False)
+    with terminal_expander:
+        terminal_placeholder = st.empty()  # Single placeholder for terminal output
     results_container = st.empty()
     
     # Initialize terminal output in session state if it doesn't exist
@@ -205,12 +207,12 @@ def main():
                 log_entry = self.format(record)
                 # Append new log entry to existing logs
                 st.session_state.terminal_output += log_entry + "\n"
-                # Update the terminal output in the expander
-                terminal_container.text_area(
-                    label="",  # Remove label since we have the expander header
+                # Update the terminal output using the placeholder
+                terminal_placeholder.text_area(
+                    label="",
                     value=st.session_state.terminal_output,
                     height=300,
-                    disabled=True  # Make it read-only
+                    disabled=True
                 )
             except Exception as e:
                 print(f"Error in StreamlitHandler: {e}")
