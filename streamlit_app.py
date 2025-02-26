@@ -57,7 +57,7 @@ def main():
         with st.expander("NSRDB API Settings", expanded=False):
             api_key = st.text_input(
                 "API Key",
-                value="j2onuxe80weyakaW10yryNHuXMTfFHaYMqRYhK57",
+                value="UJKXTKMu2Pd3W97ASDKjYMAt3xc3OI4LtURDSl9a",
                 help="Enter your NREL API key. Default key is provided but may have usage limits."
             )
             
@@ -65,13 +65,13 @@ def main():
             st.subheader("User Information")
             name = st.text_input(
                 "Full Name",
-                value="Gautham Ramesh",
+                value="cleanai energy",
                 help="Your full name for NSRDB records"
             )
             
             email = st.text_input(
                 "Email",
-                value="gauthamramesh0@gmail.com",
+                value="tech@cleanaienergy.com",
                 help="Your email address for NSRDB records"
             )
             
