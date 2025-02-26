@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Union
 from pathlib import Path
 import urllib.parse
 import hashlib
@@ -14,6 +14,10 @@ import ssl
 import urllib.request
 from io import StringIO
 import requests
+import time
+import io
+import zipfile
+from tmy_calcs import TMYCalculator
 
 # Configure logging
 logging.basicConfig(
@@ -26,10 +30,15 @@ class NSRDBSAMAnalyzer:
     def __init__(
         self,
         api_key: str,
-        lat: float,
-        lon: float,
+        lat: float = None,
+        lon: float = None,
+        location_id: str = None,
         system_capacity_mw: float = 1000.0,
         years: List[int] = None,
+        include_tmy: bool = False,
+        tmy_version: str = 'tmy',
+        tmy_method: str = 'api',
+        tmy_percentile: float = 50.0,
         cache_dir: str = "nsrdb_cache",
         dc_ac_ratio: float = 1.3,
         gcr: float = 0.35,
@@ -42,8 +51,19 @@ class NSRDBSAMAnalyzer:
         self.api_key = api_key
         self.lat = lat
         self.lon = lon
+        self.location_id = location_id
+        self.include_tmy = include_tmy
+        self.tmy_version = tmy_version
+        self.tmy_method = tmy_method
+        self.tmy_percentile = tmy_percentile
         self.system_capacity = system_capacity_mw * 1000  # Convert MW to kW for SAM
-        self.years = years or list(range(1998, 2023))  # 1998-2022
+        
+        # Only set default years if neither years nor TMY are specified
+        if years is None and not include_tmy:
+            self.years = list(range(1998, 2023))  # Default to 1998-2022
+        else:
+            self.years = years  # Could be None for TMY-only analysis
+        
         self.cache_dir = cache_dir
         
         # SAM configuration
@@ -123,6 +143,10 @@ class NSRDBSAMAnalyzer:
         self.your_email = 'gauthamramesh0@gmail.com'
         self.mailing_list = 'false'
 
+        # Validate location parameters
+        if not ((lat is not None and lon is not None) or location_id is not None):
+            raise ValueError("Must provide either lat/lon or location_id")
+
     def create_simulation_dir(self, base_output_dir: str = "results") -> str:
         """Create a unique directory for this simulation run."""
         # Create base output directory if it doesn't exist
@@ -163,12 +187,16 @@ class NSRDBSAMAnalyzer:
         cache_file = self._get_cache_filename(year)
         
         if os.path.exists(cache_file):
-            # Read the first line to get metadata
-            metadata = pd.read_csv(cache_file, nrows=1)
-            # Read the rest of the file for actual data
-            df = pd.read_csv(cache_file, skiprows=2)
-            logger.info(f"Loaded data from cache: {cache_file}")
-            return df, metadata
+            try:
+                # Read the first line to get metadata
+                metadata = pd.read_csv(cache_file, nrows=1)
+                # Read the rest of the file for actual data
+                df = pd.read_csv(cache_file, skiprows=2)
+                logger.info(f"Loaded data from cache: {cache_file}")
+                return df, metadata
+            except Exception as e:
+                logger.warning(f"Error reading cache file {cache_file}: {e}")
+                return None, None
         
         return None, None
 
@@ -287,17 +315,25 @@ class NSRDBSAMAnalyzer:
         logger.info('Running SAM simulation with bifacial panels')
         ssc = pssc.PySSC()
         
+        # Ensure we have a datetime index
+        if 'datetime' in df.columns:
+            df = df.set_index('datetime')
+        
         # Create weather data
         wfd = ssc.data_create()
         ssc.data_set_number(wfd, b'lat', self.lat)
         ssc.data_set_number(wfd, b'lon', self.lon)
         ssc.data_set_number(wfd, b'tz', timezone)
         ssc.data_set_number(wfd, b'elev', elevation)
+        
+        # Set time arrays using datetime index
         ssc.data_set_array(wfd, b'year', df.index.year)
         ssc.data_set_array(wfd, b'month', df.index.month)
         ssc.data_set_array(wfd, b'day', df.index.day)
         ssc.data_set_array(wfd, b'hour', df.index.hour)
         ssc.data_set_array(wfd, b'minute', df.index.minute)
+        
+        # Set weather data
         ssc.data_set_array(wfd, b'dn', df['DNI'])
         ssc.data_set_array(wfd, b'df', df['DHI'])
         ssc.data_set_array(wfd, b'wspd', df['Wind Speed'])
@@ -308,10 +344,10 @@ class NSRDBSAMAnalyzer:
         ssc.data_set_table(dat, b'solar_resource_data', wfd)
         ssc.data_free(wfd)
 
-        # Adjust system capacity to account for DC/AC ratio to achieve desired AC output
-        dc_capacity = self.system_capacity * self.dc_ac_ratio  # This makes the AC output match the desired capacity
+        # Adjust system capacity to account for DC/AC ratio
+        dc_capacity = self.system_capacity * self.dc_ac_ratio
         
-        # System Configuration for Single Axis Tracker with Bifacial Panels
+        # System Configuration
         ssc.data_set_number(dat, b'system_capacity', dc_capacity)
         ssc.data_set_number(dat, b'dc_ac_ratio', self.dc_ac_ratio)
         ssc.data_set_number(dat, b'tilt', 0)
@@ -327,8 +363,8 @@ class NSRDBSAMAnalyzer:
         ssc.data_set_number(dat, b'ground_albedo', self.ground_albedo)
         ssc.data_set_number(dat, b'bifacial_height', self.bifacial_height)
         
-        # Execute simulation with bifacial model
-        mod = ssc.module_create(b'pvwattsv7')  # Using v7 for bifacial support
+        # Execute simulation
+        mod = ssc.module_create(b'pvwattsv7')
         ssc.module_exec(mod, dat)
         
         # Get generation in kW and convert to MW
@@ -340,142 +376,417 @@ class NSRDBSAMAnalyzer:
 
         return df
 
-    def analyze_all_years(self) -> Dict:
-        """Run analysis for all specified years."""
-        results = {}
-        all_data = []  # List to store DataFrames for each year
+    def _construct_tmy_url(self) -> str:
+        """Construct the NSRDB API URL for TMY data."""
+        base_url = 'https://developer.nrel.gov/api/nsrdb/v2/solar/nsrdb-GOES-tmy-v4-0-0-download.json'
+        
+        params = {
+            'attributes': self.attributes,
+            'interval': self.interval,
+            'api_key': self.api_key,
+            'email': self.your_email,
+            'names': [self.tmy_version],
+        }
+        
+        # Add location parameter
+        if self.location_id:
+            params['location_ids'] = self.location_id
+        else:
+            params['wkt'] = f'POINT({self.lon} {self.lat})'
+        
+        return base_url, params
+
+    def _fetch_tmy_data(self) -> Tuple[pd.DataFrame, float, float]:
+        """Fetch TMY data using either API or calculated method."""
+        logger.info(f'Fetching TMY data using {self.tmy_method} method')
+        
+        if self.tmy_method == 'api':
+            return self._fetch_tmy_data_api()
+        elif self.tmy_method == 'calculated':
+            return self._fetch_tmy_data_calculated()
+        else:
+            raise ValueError(f"Invalid TMY method: {self.tmy_method}")
+
+    def _fetch_tmy_data_api(self) -> Tuple[pd.DataFrame, float, float]:
+        """Original API-based TMY fetch method"""
+        logger.info(f'Fetching TMY data using version: {self.tmy_version}')
+        
+        # Try to load from cache first
+        cache_key = f"tmy_{self.location_id or f'{self.lat}_{self.lon}'}_{self.tmy_version}"
+        df, metadata = self._load_from_cache(cache_key)
+        
+        if df is None or metadata is None:
+            base_url, params = self._construct_tmy_url()
+            
+            try:
+                headers = {'x-api-key': self.api_key}
+                response = requests.post(base_url, params, headers=headers)
+                response.raise_for_status()
+                
+                data = response.json()
+                if data.get('errors'):
+                    raise ValueError(f"API errors: {data['errors']}")
+                
+                # Get download URL from response
+                download_url = data['outputs']['downloadUrl']
+                logger.info(f"TMY data ready at: {download_url}")
+                
+                # Add retry logic for downloading data
+                max_retries = 3
+                retry_delay = 2  # seconds
+                
+                for attempt in range(max_retries):
+                    try:
+                        # Try alternate URL patterns if the first one fails
+                        urls_to_try = [
+                            download_url,
+                            download_url.replace('mapfiles.nrel.gov', 'developer.nrel.gov'),
+                            download_url.replace('gds-hsds-nsrdb-files.nrelcloud.org', 'developer.nrel.gov')
+                        ]
+                        
+                        success = False
+                        for url in urls_to_try:
+                            try:
+                                response = requests.get(url)
+                                response.raise_for_status()
+                                
+                                # Check if response is a zip file
+                                if url.endswith('.zip'):
+                                    # Read zip file in memory
+                                    z = zipfile.ZipFile(io.BytesIO(response.content))
+                                    # Get the first CSV file in the zip
+                                    csv_file = [f for f in z.namelist() if f.endswith('.csv')][0]
+                                    # Read the CSV data
+                                    with z.open(csv_file) as f:
+                                        content = io.TextIOWrapper(f, encoding='utf-8')
+                                        # Read metadata (first 2 rows)
+                                        metadata = pd.read_csv(content, nrows=1)
+                                        # Reset file pointer
+                                        content.seek(0)
+                                        # Skip metadata and header rows
+                                        df = pd.read_csv(content, skiprows=2)
+                                else:
+                                    # Direct CSV response
+                                    content = StringIO(response.text)
+                                    metadata = pd.read_csv(content, nrows=1)
+                                    content.seek(0)
+                                    df = pd.read_csv(content, skiprows=2)
+                                
+                                success = True
+                                break
+                            except (requests.exceptions.RequestException, pd.errors.EmptyDataError, zipfile.BadZipFile) as e:
+                                logger.warning(f"Failed to fetch from {url}: {str(e)}")
+                                continue
+                        
+                        if not success:
+                            raise requests.exceptions.RequestException("All URL patterns failed")
+                        
+                        # Verify we got valid data
+                        if df.empty or metadata.empty:
+                            raise ValueError("Retrieved data is empty")
+                        
+                        # Cache the data
+                        self._save_to_cache(df, metadata, cache_key)
+                        break
+                        
+                    except Exception as e:
+                        if attempt == max_retries - 1:  # Last attempt
+                            raise
+                        logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+            
+            except Exception as e:
+                logger.error(f'Error fetching TMY data: {str(e)}')
+                raise
+        
+        # Process the data similar to yearly data
+        timezone = float(metadata['Local Time Zone'].iloc[0])
+        elevation = float(metadata['Elevation'].iloc[0])
+        
+        # Create datetime index using 1900 as the standard year for TMY data
+        df['datetime'] = pd.to_datetime({
+            'year': 1900,  # Use 1900 as standard year for TMY
+            'month': df['Month'],
+            'day': df['Day'],
+            'hour': df['Hour'] - 1
+        })
+        
+        df = df.set_index('datetime')
+        df = df.sort_index()
+        
+        if len(df) != 8760:
+            logger.warning(f"TMY data has {len(df)} hours instead of 8760")
+            if len(df) < 8760:
+                raise ValueError(f"Insufficient TMY data: only {len(df)} hours")
+            else:
+                df = df.iloc[:8760]
+        
+        logger.info(f'Successfully loaded TMY data with {len(df)} hourly periods')
+        return df, timezone, elevation
+
+    def _fetch_tmy_data_calculated(self) -> Tuple[pd.DataFrame, float, float]:
+        """Calculate TMY data from historical years."""
+        if not self.years:
+            raise ValueError("Historical years required for calculated TMY")
+        
+        # Collect all historical data
+        all_data = []
+        timezone = None
+        elevation = None
         
         for year in self.years:
-            try:
-                # Fetch data
-                df, timezone, elevation = self.fetch_nsrdb_data(year)
-                
-                # Verify we have exactly 8760 hours (365 days)
-                if len(df) != 8760:
-                    logger.warning(f"Year {year} has {len(df)} hours instead of 8760")
-                    continue
-                
-                # Run simulation
-                df_with_gen = self.run_sam_simulation(df, timezone, elevation)
-                
-                # Calculate metrics (generation is now in MW)
-                annual_generation = df_with_gen['generation'].sum()  # Already in MWh since it's hourly data
-                capacity_factor = annual_generation / (8760 * (self.system_capacity/1000))  # 8760 hours per year
-                
-                # Calculate MWh per MW-ac
-                mwh_per_mw = annual_generation / (self.system_capacity/1000)
-                
-                # Find minimum week generation
-                df_with_gen['datetime'] = df_with_gen.index
-                weekly_gen = df_with_gen.set_index('datetime').resample('7D')['generation'].sum()  # Already in MWh
-                min_week = weekly_gen.min()
-                min_week_start = weekly_gen.idxmin()
-                min_week_mwh_per_mw = min_week / (self.system_capacity/1000)
-                
-                # Prepare time series data
-                ts_data = df_with_gen.copy()
-                ts_data['year'] = ts_data.index.year
-                ts_data['month'] = ts_data.index.month
-                ts_data['day'] = ts_data.index.day
-                ts_data['hour'] = ts_data.index.hour
-                ts_data['minute'] = ts_data.index.minute
-                
-                # Store results
-                results[year] = {
-                    'annual_generation_mwh': annual_generation,
-                    'capacity_factor': capacity_factor,
-                    'mwh_per_mw': mwh_per_mw,
-                    'min_week_generation_mwh': min_week,
-                    'min_week_start_date': min_week_start,
-                    'min_week_mwh_per_mw': min_week_mwh_per_mw,
-                    'data': ts_data
-                }
-                
-                # Add to combined data
-                all_data.append(ts_data)
-                
-                logger.info(f'Year {year} analysis complete:')
-                logger.info(f'  - Annual Generation: {annual_generation:.2f} MWh')
-                logger.info(f'  - Capacity Factor: {capacity_factor:.3%}')
-                logger.info(f'  - MWh per MW-ac: {mwh_per_mw:.2f}')
-                logger.info(f'  - Min Week Generation: {min_week:.2f} MWh (starting {min_week_start.strftime("%Y-%m-%d")})')
-                
-            except Exception as e:
-                logger.error(f'Error processing year {year}: {str(e)}')
-                continue
+            df, tz, elev = self.fetch_nsrdb_data(year)
+            # Run SAM simulation first to get generation data
+            df_with_gen = self.run_sam_simulation(df, tz, elev)
+            # Ensure datetime is preserved
+            df_with_gen = df_with_gen.reset_index()
+            all_data.append(df_with_gen)
+            if timezone is None:
+                timezone = tz
+                elevation = elev
         
-        # Combine all years' data
+        # Combine all historical data
+        historical_df = pd.concat(all_data, ignore_index=True)
+        
+        # Initialize TMY calculator
+        calculator = TMYCalculator(historical_df, date_column='datetime')
+        
+        # Save TMY data files
+        tmy_dir = os.path.join(self.simulation_dir, 'tmy_data')
+        calculator.save_tmy_data(tmy_dir)
+        
+        # Generate scenarios
+        scenarios = calculator.generate_all_scenarios()
+        
+        # Run SAM simulation on each scenario
+        tmy_results = {}
+        for scenario_name, scenario_df in scenarios.items():
+            logger.info(f"Processing {scenario_name} TMY scenario")
+            # Convert datetime back to index for SAM simulation
+            scenario_df_indexed = scenario_df.set_index('datetime')
+            tmy_results[scenario_name.lower()] = self.run_sam_simulation(scenario_df_indexed, timezone, elevation)
+        
+        # Store scenarios in results
+        self.tmy_scenarios = tmy_results
+        
+        logger.info(f'Generated TMY scenarios (P50/P10/P90) from {len(self.years)} years')
+        
+        return tmy_results['p50'], timezone, elevation
+
+    def analyze_all_years(self) -> Dict:
+        """Run analysis for all specified years and/or TMY data."""
+        results = {}
+        all_data = []
+        
+        # Run historical analysis if years are specified
+        if self.years:
+            for year in self.years:
+                try:
+                    df, timezone, elevation = self.fetch_nsrdb_data(year)
+                    df_with_gen = self.run_sam_simulation(df, timezone, elevation)
+                    results[year] = self._calculate_metrics(df_with_gen, str(year))
+                    all_data.append(df_with_gen)
+                except Exception as e:
+                    logger.error(f'Error processing year {year}: {str(e)}')
+                    continue
+        
+        # Run TMY analysis if included or if no years specified
+        if self.include_tmy or not self.years:
+            try:
+                df, timezone, elevation = self._fetch_tmy_data()
+                if self.tmy_method == 'calculated':
+                    # TMY metrics are already calculated for each scenario
+                    results['tmy'] = {
+                        'method': 'calculated',
+                        'p50': self._calculate_metrics(self.tmy_scenarios['p50'], 'TMY-P50'),
+                        'p10': self._calculate_metrics(self.tmy_scenarios['p10'], 'TMY-P10'),
+                        'p90': self._calculate_metrics(self.tmy_scenarios['p90'], 'TMY-P90')
+                    }
+                    all_data.extend([self.tmy_scenarios[s] for s in ['p50', 'p10', 'p90']])
+                else:
+                    # API TMY
+                    df_with_gen = self.run_sam_simulation(df, timezone, elevation)
+                    results['tmy'] = {
+                        'method': 'api',
+                        'version': self.tmy_version,
+                        **self._calculate_metrics(df_with_gen, 'TMY')
+                    }
+                    all_data.append(df_with_gen)
+            except Exception as e:
+                logger.error(f'Error processing TMY data: {str(e)}')
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Combine all data and calculate overall metrics
         if all_data:
             combined_df = pd.concat(all_data)
             results['combined_data'] = combined_df
-            
-            # Calculate overall minimum MWh per MW-ac
-            all_years_min_mwh_per_mw = min(results[year]['mwh_per_mw'] for year in self.years if year in results)
-            results['overall_min_mwh_per_mw'] = all_years_min_mwh_per_mw
-            
-            # Find absolute worst week across all years
-            combined_df['datetime'] = combined_df.index
-            all_weekly_gen = combined_df.set_index('datetime').resample('7D')['generation'].sum()  # Already in MWh
-            worst_week = all_weekly_gen.min()
-            worst_week_start = all_weekly_gen.idxmin()
-            worst_week_mwh_per_mw = worst_week / (self.system_capacity/1000)
-            
-            results['absolute_worst_week'] = {
-                'generation_mwh': worst_week,
-                'start_date': worst_week_start,
-                'mwh_per_mw': worst_week_mwh_per_mw
-            }
-            
+            self._calculate_overall_metrics(results)
+        else:
+            raise ValueError("No data was successfully processed")
+        
         return results
 
-    def clean_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-        """
-        Clean the data by identifying and removing days with missing data.
-        Returns cleaned DataFrame and dictionary with cleaning info.
-        """
-        logger.info("Starting data cleaning process...")
+    def _calculate_metrics(self, df: pd.DataFrame, period: str) -> Dict:
+        """Calculate performance metrics for a given period."""
+        # Create a copy of the DataFrame to avoid modifying the original
+        df_copy = df.copy()
         
-        # Store original shape
-        original_rows = len(df)
+        # Ensure datetime index is timezone-naive
+        if df_copy.index.tz is not None:
+            df_copy.index = df_copy.index.tz_localize(None)
         
-        # Create expected datetime range at hourly intervals
-        expected_range = pd.date_range(
-            start=df.index.min(),
-            end=df.index.max(),
-            freq='H'
-        )
+        annual_generation = df_copy['generation'].sum()
+        capacity_factor = annual_generation / (8760 * (self.system_capacity/1000))
+        mwh_per_mw = annual_generation / (self.system_capacity/1000)
         
-        # Find missing timestamps
-        missing_times = expected_range.difference(df.index)
+        # Calculate weekly metrics
+        df_copy['datetime'] = df_copy.index
+        weekly_gen = df_copy.set_index('datetime').resample('7D')['generation'].sum()
+        min_week = weekly_gen.min()
+        min_week_start = weekly_gen.idxmin()
+        min_week_mwh_per_mw = min_week / (self.system_capacity/1000)
         
-        # Get days with missing data
-        days_with_missing = pd.Series(missing_times.date).unique()
+        # Format the date string based on whether it's TMY or historical data
+        date_format = '%m-%d' if 'TMY' in period else '%Y-%m-%d'
         
-        # Create cleaning report
-        cleaning_info = {
-            'original_rows': original_rows,
-            'missing_timestamps': missing_times.tolist(),
-            'days_with_missing': [d.strftime('%Y-%m-%d') for d in days_with_missing],
-            'total_missing_hours': len(missing_times),
-            'total_days_removed': len(days_with_missing)
+        logger.info(f'{period} analysis complete:')
+        logger.info(f'  - Annual Generation: {annual_generation:.2f} MWh')
+        logger.info(f'  - Capacity Factor: {capacity_factor:.3%}')
+        logger.info(f'  - MWh per MW-ac: {mwh_per_mw:.2f}')
+        logger.info(f'  - Min Week Generation: {min_week:.2f} MWh (starting {min_week_start.strftime(date_format)})')
+        
+        return {
+            'annual_generation_mwh': annual_generation,
+            'capacity_factor': capacity_factor,
+            'mwh_per_mw': mwh_per_mw,
+            'min_week_generation_mwh': min_week,
+            'min_week_start_date': min_week_start,
+            'min_week_mwh_per_mw': min_week_mwh_per_mw,
+            'data': df_copy
+        }
+
+    def _calculate_overall_metrics(self, results: Dict):
+        """Calculate overall metrics for the combined data."""
+        combined_df = results['combined_data']
+        
+        # Calculate minimum MWh per MW-ac across all periods (including TMY if present)
+        periods_to_check = []
+        mwh_per_mw_values = []
+        
+        # Add historical years
+        if self.years:
+            periods_to_check.extend([year for year in self.years if year in results])
+            mwh_per_mw_values.extend([results[period]['mwh_per_mw'] for period in periods_to_check])
+        
+        # Add TMY values
+        if self.include_tmy and 'tmy' in results:
+            if results['tmy']['method'] == 'calculated':
+                # For calculated TMY, include all scenarios
+                mwh_per_mw_values.extend([
+                    results['tmy']['p50']['mwh_per_mw'],
+                    results['tmy']['p10']['mwh_per_mw'],
+                    results['tmy']['p90']['mwh_per_mw']
+                ])
+            else:
+                # For API TMY, just include the single value
+                mwh_per_mw_values.append(results['tmy']['mwh_per_mw'])
+        
+        # Calculate overall minimum
+        if mwh_per_mw_values:
+            results['overall_min_mwh_per_mw'] = min(mwh_per_mw_values)
+        else:
+            results['overall_min_mwh_per_mw'] = None
+        
+        # Find absolute worst week across all data
+        combined_df['datetime'] = combined_df.index
+        all_weekly_gen = combined_df.set_index('datetime').resample('7D')['generation'].sum()
+        worst_week = all_weekly_gen.min()
+        worst_week_start = all_weekly_gen.idxmin()
+        worst_week_mwh_per_mw = worst_week / (self.system_capacity/1000)
+        
+        results['absolute_worst_week'] = {
+            'generation_mwh': worst_week,
+            'start_date': worst_week_start,
+            'mwh_per_mw': worst_week_mwh_per_mw
         }
         
-        # Remove days with missing data
-        if len(days_with_missing) > 0:
-            clean_df = df.copy()
-            for day in days_with_missing:
-                clean_df = clean_df[clean_df.index.date != day]
-            
-            cleaning_info['final_rows'] = len(clean_df)
-            cleaning_info['removed_rows'] = original_rows - len(clean_df)
-            
-            logger.info(f"Found {len(missing_times)} missing hours across {len(days_with_missing)} days")
-            logger.info(f"Removed {cleaning_info['removed_rows']} rows from dataset")
-            
-            return clean_df, cleaning_info
+        # Log key findings
+        logger.info("\nKey Findings:")
+        logger.info(f"Minimum MWh per MW-ac: {results['overall_min_mwh_per_mw']:.2f}")
+        logger.info(f"Worst week generation: {worst_week:.2f} MWh")
+        logger.info(f"Worst week start date: {worst_week_start.strftime('%Y-%m-%d')}")
+        logger.info(f"Worst week MWh per MW-ac: {worst_week_mwh_per_mw:.2f}")
         
-        cleaning_info['final_rows'] = original_rows
-        cleaning_info['removed_rows'] = 0
+        # Add TMY summary to results
+        if self.include_tmy and 'tmy' in results:
+            if results['tmy']['method'] == 'calculated':
+                logger.info("\nTMY Scenarios:")
+                logger.info(f"P50 (Median) TMY: {results['tmy']['p50']['mwh_per_mw']:.2f} MWh/MW")
+                logger.info(f"P10 (Optimistic) TMY: {results['tmy']['p10']['mwh_per_mw']:.2f} MWh/MW")
+                logger.info(f"P90 (Conservative) TMY: {results['tmy']['p90']['mwh_per_mw']:.2f} MWh/MW")
+            else:
+                logger.info(f"\nTMY ({results['tmy']['version']}): {results['tmy']['mwh_per_mw']:.2f} MWh/MW")
+
+    def clean_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+        """Clean the data by identifying and handling missing values."""
+        logger.info("Starting data cleaning process...")
+        
+        # Store original number of rows
+        original_rows = len(df)
+        
+        # Initialize cleaning info dictionary
+        cleaning_info = {
+            'original_rows': original_rows,
+            'final_rows': original_rows,
+            'removed_rows': 0,
+            'total_missing_hours': 0,
+            'total_days_removed': 0,
+            'days_with_missing': [],
+            'missing_timestamps': []
+        }
+        
+        # Check for missing values
+        if df.isnull().any().any():
+            # Get start and end dates for the entire dataset
+            start_date = df.index.min()
+            end_date = df.index.max()
+            
+            # Create expected hourly timestamps
+            expected_range = pd.date_range(
+                start=start_date,
+                end=end_date,
+                freq='h'  # Use 'h' instead of 'H'
+            )
+            
+            # Find missing timestamps
+            missing_times = expected_range.difference(df.index)
+            
+            if len(missing_times) > 0:
+                # Get unique dates with missing data
+                days_with_missing = sorted(list(set(missing_times.date)))
+                
+                logger.info(f"Found {len(missing_times)} missing hours across {len(days_with_missing)} days")
+                
+                # Store missing data info
+                cleaning_info['total_missing_hours'] = len(missing_times)
+                cleaning_info['total_days_removed'] = len(days_with_missing)
+                cleaning_info['days_with_missing'] = days_with_missing
+                cleaning_info['missing_timestamps'] = [ts.strftime('%Y-%m-%d %H:%M') for ts in missing_times]
+                
+                # Remove days with any missing data
+                for day in days_with_missing:
+                    clean_df = df[df.index.date != day]
+                
+                cleaning_info['final_rows'] = len(clean_df)
+                cleaning_info['removed_rows'] = original_rows - len(clean_df)
+                
+                logger.info(f"Removed {cleaning_info['removed_rows']} rows from dataset")
+                
+                return clean_df, cleaning_info
+            
+        # If no cleaning was needed
         logger.info("No missing data found")
         return df, cleaning_info
 
@@ -549,39 +860,65 @@ class NSRDBSAMAnalyzer:
             
             # Save detailed summary statistics
             summary_data = []
-            for year in self.years:
-                if year in results:
+            
+            # Add historical data if available
+            if self.years:
+                for year in self.years:
+                    if year in results:
+                        summary_data.append({
+                            'Period': str(year),
+                            'Annual Generation (MWh)': results[year]['annual_generation_mwh'],
+                            'Capacity Factor (%)': results[year]['capacity_factor'] * 100,
+                            'MWh per MW-ac': results[year]['mwh_per_mw'],
+                            'Min Week Generation (MWh)': results[year]['min_week_generation_mwh'],
+                            'Min Week Start Date': results[year]['min_week_start_date'].strftime('%Y-%m-%d'),
+                            'Min Week MWh per MW-ac': results[year]['min_week_mwh_per_mw']
+                        })
+            
+            # Add TMY data if included
+            if self.include_tmy and 'tmy' in results:
+                if results['tmy']['method'] == 'calculated':
+                    # Handle calculated TMY scenarios
+                    for scenario in ['p50', 'p10', 'p90']:
+                        summary_data.append({
+                            'Period': f'TMY-{scenario.upper()}',
+                            'Annual Generation (MWh)': results['tmy'][scenario]['annual_generation_mwh'],
+                            'Capacity Factor (%)': results['tmy'][scenario]['capacity_factor'] * 100,
+                            'MWh per MW-ac': results['tmy'][scenario]['mwh_per_mw'],
+                            'Min Week Generation (MWh)': results['tmy'][scenario]['min_week_generation_mwh'],
+                            'Min Week Start Date': results['tmy'][scenario]['min_week_start_date'].strftime('%m-%d'),
+                            'Min Week MWh per MW-ac': results['tmy'][scenario]['min_week_mwh_per_mw']
+                        })
+                else:
+                    # Handle API TMY data
+                    tmy_data = {k: v for k, v in results['tmy'].items() 
+                               if k not in ['method', 'version']}  # Exclude method and version keys
                     summary_data.append({
-                        'Year': year,
-                        'Annual Generation (MWh)': results[year]['annual_generation_mwh'],
-                        'Capacity Factor (%)': results[year]['capacity_factor'] * 100,
-                        'MWh per MW-ac': results[year]['mwh_per_mw'],
-                        'Min Week Generation (MWh)': results[year]['min_week_generation_mwh'],
-                        'Min Week Start Date': results[year]['min_week_start_date'].strftime('%Y-%m-%d'),
-                        'Min Week MWh per MW-ac': results[year]['min_week_mwh_per_mw']
+                        'Period': f"TMY-{results['tmy'].get('version', 'API')}",
+                        'Annual Generation (MWh)': tmy_data['annual_generation_mwh'],
+                        'Capacity Factor (%)': tmy_data['capacity_factor'] * 100,
+                        'MWh per MW-ac': tmy_data['mwh_per_mw'],
+                        'Min Week Generation (MWh)': tmy_data['min_week_generation_mwh'],
+                        'Min Week Start Date': tmy_data['min_week_start_date'].strftime('%m-%d'),
+                        'Min Week MWh per MW-ac': tmy_data['min_week_mwh_per_mw']
                     })
             
             summary_df = pd.DataFrame(summary_data)
             
             # Add overall statistics
-            summary_df.loc['Overall Min'] = {
-                'Year': 'All Years',
-                'MWh per MW-ac': results['overall_min_mwh_per_mw'],
-                'Min Week Generation (MWh)': results['absolute_worst_week']['generation_mwh'],
-                'Min Week Start Date': results['absolute_worst_week']['start_date'].strftime('%Y-%m-%d'),
-                'Min Week MWh per MW-ac': results['absolute_worst_week']['mwh_per_mw']
-            }
+            if 'overall_min_mwh_per_mw' in results:
+                overall_stats = {
+                    'Period': 'Overall',
+                    'MWh per MW-ac': results['overall_min_mwh_per_mw'],
+                    'Min Week Generation (MWh)': results['absolute_worst_week']['generation_mwh'],
+                    'Min Week Start Date': results['absolute_worst_week']['start_date'].strftime('%Y-%m-%d'),
+                    'Min Week MWh per MW-ac': results['absolute_worst_week']['mwh_per_mw']
+                }
+                summary_df = pd.concat([summary_df, pd.DataFrame([overall_stats])], ignore_index=True)
             
             summary_path = os.path.join(self.simulation_dir, 'summary_statistics.csv')
             summary_df.to_csv(summary_path, index=False)
             logger.info(f'Summary statistics saved to: {summary_path}')
-            
-            # Log key findings
-            logger.info("\nKey Findings:")
-            logger.info(f"Minimum MWh per MW-ac across all years: {results['overall_min_mwh_per_mw']:.2f}")
-            logger.info(f"Worst week generation: {results['absolute_worst_week']['generation_mwh']:.2f} MWh")
-            logger.info(f"Worst week start date: {results['absolute_worst_week']['start_date'].strftime('%Y-%m-%d')}")
-            logger.info(f"Worst week MWh per MW-ac: {results['absolute_worst_week']['mwh_per_mw']:.2f}")
 
     def dump_system_settings(self, output_dir: str = "results") -> Dict:
         """Dump all PV system settings and configuration details to a JSON file."""
@@ -595,12 +932,19 @@ class NSRDBSAMAnalyzer:
             total_efficiency *= (1 - loss_value/100)
         total_dc_loss_verification = (1 - total_efficiency) * 100
         
+        # Determine analysis period string based on available data
+        if self.years:
+            analysis_period = f"{min(self.years)}-{max(self.years)}"
+        else:
+            analysis_period = f"TMY ({self.tmy_version})"
+        
         # Compile system settings
         settings = {
             "Location": {
                 "latitude": self.lat,
                 "longitude": self.lon,
-                "years_analyzed": self.years
+                "years_analyzed": self.years if self.years else None,
+                "tmy_version": self.tmy_version if self.include_tmy or not self.years else None
             },
             "Data Source": {
                 "api": "NREL NSRDB PSM v3.2.2",
@@ -672,7 +1016,7 @@ class NSRDBSAMAnalyzer:
                 "sam_version": "PVWatts v7",
                 "model_type": "Bifacial-enabled hourly simulation",
                 "time_resolution": "Hourly",
-                "analysis_period": f"{min(self.years)}-{max(self.years)}"
+                "analysis_period": analysis_period
             }
         }
         
@@ -790,30 +1134,42 @@ class NSRDBSAMAnalyzer:
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='NSRDB SAM Analysis Tool')
-    parser.add_argument('--api-key', type=str, default='j2onuxe80weyakaW10yryNHuXMTfFHaYMqRYhK57',
-                        help='NREL API key')
-    parser.add_argument('--lat', type=float, default=31.43194,
-                        help='Latitude of the location')
-    parser.add_argument('--lon', type=float, default=-97.42500,
-                        help='Longitude of the location')
-    parser.add_argument('--capacity', type=float, default=1000.0,
-                        help='System capacity in MW AC')
-    parser.add_argument('--years', type=int, nargs='+',
-                        help='Years to analyze (default: 1998-2022)')
-    parser.add_argument('--dump-only', action='store_true',
-                        help='Only dump system settings JSON file without running analysis')
-    parser.add_argument('--output-dir', type=str, default='results',
-                        help='Output directory for results')
+    parser.add_argument('--api-key', type=str, default='j2onuxe80weyakaW10yryNHuXMTfFHaYMqRYhK57')
+    parser.add_argument('--lat', type=float, default=31.43194)
+    parser.add_argument('--lon', type=float, default=-97.42500)
+    parser.add_argument('--capacity', type=float, default=1000.0)
+    parser.add_argument('--years', type=int, nargs='*')
+    parser.add_argument('--location-id', type=str)
+    parser.add_argument('--include-tmy', action='store_true')
+    parser.add_argument('--tmy-version', type=str, choices=['tmy', 'tmy-2023'], default='tmy')
+    parser.add_argument('--tmy-method', type=str, choices=['api', 'calculated'], default='api')
+    parser.add_argument('--tmy-percentile', type=float, default=50.0)
+    parser.add_argument('--dump-only', action='store_true')
+    parser.add_argument('--output-dir', type=str, default='results')
     
     args = parser.parse_args()
+    
+    # Handle TMY-only case
+    if args.years is not None and len(args.years) == 0:
+        # User specified --years with no values, indicating TMY-only
+        args.include_tmy = True
+        args.years = None
+    elif args.years is None and not args.include_tmy:
+        # No years specified and no TMY flag, default to include TMY
+        args.include_tmy = True
     
     # Initialize analyzer
     analyzer = NSRDBSAMAnalyzer(
         api_key=args.api_key,
-        lat=args.lat,
-        lon=args.lon,
+        lat=args.lat if not args.location_id else None,
+        lon=args.lon if not args.location_id else None,
+        location_id=args.location_id,
         system_capacity_mw=args.capacity,
-        years=args.years
+        years=args.years,
+        include_tmy=args.include_tmy,
+        tmy_version=args.tmy_version,
+        tmy_method=args.tmy_method,
+        tmy_percentile=args.tmy_percentile
     )
     
     # Dump system settings
