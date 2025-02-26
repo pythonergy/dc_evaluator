@@ -137,10 +137,10 @@ class NSRDBSAMAnalyzer:
         self.attributes = 'ghi,dhi,dni,wind_speed,air_temperature,solar_zenith_angle'
         self.interval = '60'  # 60-minute intervals
         self.utc = 'false'    # Use local time
-        self.your_name = 'Gautham Ramesh'
+        self.your_name = 'cleanai energy'
         self.reason_for_use = 'Research and Analysis'
         self.your_affiliation = 'Research Institution'
-        self.your_email = 'gauthamramesh0@gmail.com'
+        self.your_email = 'tech@cleanaienergy.com'
         self.mailing_list = 'false'
 
         # Validate location parameters
@@ -1134,7 +1134,7 @@ class NSRDBSAMAnalyzer:
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='NSRDB SAM Analysis Tool')
-    parser.add_argument('--api-key', type=str, default='j2onuxe80weyakaW10yryNHuXMTfFHaYMqRYhK57')
+    parser.add_argument('--api-key', type=str, default='UJKXTKMu2Pd3W97ASDKjYMAt3xc3OI4LtURDSl9a')
     parser.add_argument('--lat', type=float, default=31.43194)
     parser.add_argument('--lon', type=float, default=-97.42500)
     parser.add_argument('--capacity', type=float, default=1000.0)
